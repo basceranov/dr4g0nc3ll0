@@ -1,0 +1,42 @@
+{
+  "metadata": {
+    "report_id": "RPT-20251105-0001",
+    "title": "OSINT Report \u2014 Sudan El-Fasher humanitarian",
+    "query": "Sudan El-Fasher humanitarian",
+    "generated_at": "2025-11-05T00:15:19.212417",
+    "analyst": "Auto",
+    "tool_version": "osint-pipeline 2.1",
+    "llm": {}
+  },
+  "scope": {
+    "time_window": {
+      "from": "2025-10-06",
+      "to": "2025-11-05"
+    },
+    "languages": [
+      "it-IT"
+    ]
+  },
+  "sources": [],
+  "documents": [],
+  "findings": [],
+  "timeline": [],
+  "narrative": {
+    "sentiment": "neutral",
+    "source_mix": {}
+  },
+  "bibliography": [],
+  "methodology": {
+    "collectors": [
+      "searxng:api"
+    ],
+    "queries": [
+      "Sudan El-Fasher humanitarian"
+    ],
+    "engines_profile": "light",
+    "dedup": "(n/a minimal)",
+    "ranking": "(n/a minimal)",
+    "limitations": "Collector semplice; estrazione testo HTML basilare; nessuna LLM synthesis attiva in questa entrypoint."
+  },
+  "annex": []
+}

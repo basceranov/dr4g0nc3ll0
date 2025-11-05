@@ -1,0 +1,26 @@
+import time
+from dateutil import parser as dateparser
+from config import DOMAIN_SCORES, FRESHNESS_HALF_LIFE_DAYS
+
+def _epoch(dtiso):
+    try:
+        return dateparser.parse(dtiso).timestamp()
+    except Exception:
+        return None
+
+def _freshness(now_ts, dtiso):
+    if not dtiso: return 0.5
+    ts = _epoch(dtiso)
+    if not ts: return 0.5
+    days = max(0.0, (now_ts - ts) / 86400.0)
+    # decadimento esponenziale
+    half = float(FRESHNESS_HALF_LIFE_DAYS)
+    return 0.5 ** (days/half)
+
+def score_item(item, now_ts):
+    domain = item.get("domain","")
+    authority = DOMAIN_SCORES.get(domain, 0.3)
+    completeness = min(len(item.get("text","")) / 8000.0, 1.0)
+    freshness = _freshness(now_ts, item.get("detected_date"))
+    coherence = item.get("cross_agree", 0.5)
+    return round(0.35*freshness + 0.35*authority + 0.2*completeness + 0.1*coherence, 4)

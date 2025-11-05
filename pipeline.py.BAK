@@ -1,0 +1,137 @@
+import json, time
+from collections import defaultdict
+from searxng import searxng_search
+from fetch import fetch_and_extract
+from dedup import prepare_for_dedup, cluster_near_duplicates
+from rank import score_item
+from llm import chat
+from prompts import PLANNER_PROMPT, NER_PROMPT, SUMMARIZE_PROMPT, FACTCHECK_PROMPT, COMPOSE_PROMPT
+from provenance import log_event
+
+def planner(query: str):
+    msg = [{"role":"system","content":PLANNER_PROMPT},{"role":"user","content":query}]
+    out = chat(msg, max_tokens=900)
+    try:
+        plan = json.loads(out)
+    except Exception:
+        # fallback minimale
+        plan = {
+            "subgoals": ["Mappare attori","Raccogliere timeline","Identificare indicatori"],
+            "queries": [query, f'"{query}" site:reuters.com', f'{query} filetype:pdf'],
+            "criteria": {"freshness_days": 60, "need_institutional": True, "need_diversity": True}
+        }
+    log_event("planner_plan", plan)
+    return plan
+
+def search(plan):
+    agg = []
+    for q in plan["queries"]:
+        agg += searxng_search(q)
+    # dedup url base
+    seen = set(); uniq = []
+    for r in agg:
+        u = r.get("url");
+        if u and u not in seen:
+            uniq.append(r); seen.add(u)
+    log_event("search_uniq", {"count": len(uniq)})
+    return uniq[:80]
+
+def crawl(seeds):
+    docs = []
+    for s in seeds[:40]:
+        try:
+            ext = fetch_and_extract(s["url"])
+            docs.append({**s, **ext})
+        except Exception as e:
+            log_event("fetch_err", {"url": s.get("url"), "err": str(e)})
+            continue
+    return docs
+
+def dedup_rank(docs):
+    now_ts = time.time()
+    prepare_for_dedup(docs)
+    clusters = cluster_near_duplicates(docs)
+    picked = []
+    for group in clusters:
+        # tieni il più completo/recente del cluster
+        group = sorted(group, key=lambda d: (len(d.get("text","")), d.get("detected_date") or ""), reverse=True)
+        picked.append(group[0])
+    # ranking
+    for d in picked:
+        d["score"] = score_item(d, now_ts)
+    ranked = sorted(picked, key=lambda d: d["score"], reverse=True)
+    log_event("rank_done", {"kept": len(ranked)})
+    return ranked
+
+def ner_top(docs, topk=12):
+    joined = "\n\n".join([(d.get("title") or "") + "\n" + (d.get("text")[:2000] or "") for d in docs[:topk]])
+    msg = [{"role":"system","content":NER_PROMPT + joined}]
+    out = chat(msg, max_tokens=1000)
+    try:
+        ents = json.loads(out)
+    except Exception:
+        ents = []
+    return ents
+
+def summarize_with_citations(ranked, topk=8):
+    # prepara un pacchetto sorgenti compatto (id->[n])
+    pack = []
+    refs = {}
+    for i, d in enumerate(ranked[:topk], start=1):
+        refs[i] = d["url"]
+        pack.append({"id": i, "title": d.get("title"), "excerpt": d.get("text","")[:3000]})
+    msg = [
+        {"role":"system","content":SUMMARIZE_PROMPT},
+        {"role":"user","content":json.dumps({"sources": pack}, ensure_ascii=False)}
+    ]
+    out = chat(msg, max_tokens=1800)
+    try:
+        data = json.loads(out)
+    except Exception:
+        data = {"per_source_summary": {}, "cross_summary": "", "claims": []}
+    return data, refs
+
+def factcheck(claims, sources_map):
+    payload = {"claims": claims, "sources": sources_map}
+    msg = [{"role":"system","content":FACTCHECK_PROMPT},
+           {"role":"user","content":json.dumps(payload, ensure_ascii=False)}]
+    out = chat(msg, max_tokens=1800)
+    try:
+        checks = json.loads(out)
+    except Exception:
+        checks = [{"claim": c.get("text",""), "support":"unknown", "confidence":0.4, "notes":"insufficient evidence"} for c in claims]
+    return checks
+
+def compose_report(query, checks, ents, refs, cross_summary):
+    # riduci entità a liste per sezione
+    persons = sorted({e["entity"] for e in ents if e.get("type")=="PERSON"})[:12]
+    orgs    = sorted({e["entity"] for e in ents if e.get("type")=="ORG"})[:12]
+    locs    = sorted({e["entity"] for e in ents if e.get("type")=="LOC"})[:12]
+    indicators = sorted({e["entity"] for e in ents if e.get("type")=="INDICATOR"})[:12]
+    # prepara input compositore
+    key_findings = [{"claim": x.get("claim") or x.get("text",""),
+                     "confidence": x.get("confidence",0.5)} for x in checks]
+    timeline = []  # opzionale: puoi popolarla estraendo DATE dai testi
+    payload = {
+        "query": query,
+        "key_findings": key_findings,
+        "entities": {"persons": persons, "orgs": orgs, "locs": locs, "indicators": indicators},
+        "refs": refs,
+        "timeline": timeline,
+        "cross_summary": cross_summary
+    }
+    msg = [{"role":"system","content":COMPOSE_PROMPT},
+           {"role":"user","content":json.dumps(payload, ensure_ascii=False)}]
+    md = chat(msg, max_tokens=2200)
+    return md
+
+def run_pipeline(query: str, topk: int = 8):
+    plan = planner(query)
+    seeds = search(plan)
+    docs = crawl(seeds)
+    ranked = dedup_rank(docs)
+    ents = ner_top(ranked, topk=topk)
+    summ, refs = summarize_with_citations(ranked, topk=topk)
+    checks = factcheck(summ.get("claims", []), refs)
+    md = compose_report(query, checks, ents, refs, summ.get("cross_summary",""))
+    return md, {"ranked": ranked, "entities": ents, "refs": refs, "checks": checks, "plan": plan}
