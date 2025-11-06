@@ -34,3 +34,37 @@ DOMAIN_SCORES = {
 # -------- Output --------
 DEFAULT_TOPK = int(os.getenv("DEFAULT_TOPK", "8"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
+
+# Profili motori SearXNG (stringhe di engines separati da virgola)
+ENGINES_PROFILE_LIGHT = "google,qwant,startpage,wikipedia,wikinews"
+ENGINES_PROFILE_INSTITUTIONAL = "wikipedia,wikinews"
+
+# Toggle fonti istituzionali aggiuntive (API/feeds)
+USE_RELIEFWEB = True
+RELIEFWEB_API = "https://api.reliefweb.int/v1/reports"
+RELIEFWEB_LIMIT = int(os.getenv("RELIEFWEB_LIMIT", "20"))
+RELIEFWEB_QUERY = os.getenv("RELIEFWEB_QUERY", "Sudan")
+
+# Visual
+ASSETS_DIR = os.getenv("ASSETS_DIR", "assets")
+CHART_STYLE = os.getenv("CHART_STYLE", "default")  # riservato per future opzioni
+
+# Regole “stato della prova”
+REQUIRED_INDEPENDENT_SOURCES = int(os.getenv("REQUIRED_INDEPENDENT_SOURCES", "2"))
+MIN_SUPPORTING_SOURCES = int(os.getenv("MIN_SUPPORTING_SOURCES", "2"))
+
+# Mappa “tipi fonte” per dominio (espandibile)
+SOURCE_TYPE_BY_DOMAIN = {
+    "reliefweb.int": "UN/OCHA",
+    "unhcr.org": "UN/UNHCR",
+    "who.int": "UN/WHO",
+    "icrc.org": "ICRC",
+    "msf.org": "NGO",
+    "amnesty.org": "NGO",
+    "hrw.org": "NGO",
+    "reuters.com": "Media-Intl",
+    "bbc.com": "Media-Intl",
+    "ansa.it": "Media-IT",
+    "repubblica.it": "Media-IT",
+    "tg24.sky.it": "Media-IT",
+}

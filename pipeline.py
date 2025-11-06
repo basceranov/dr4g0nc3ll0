@@ -1,408 +1,326 @@
-# pipeline.py
-# OSINT multi-agent pipeline (v2) con fonti istituzionali, stato della prova, timeline, e grafici.
-
-from __future__ import annotations
-
-import json
-import time
-from typing import Dict, List, Any, Tuple
+# pipeline.py (solo parti cambiate/rilevanti)
+import json, time
+from datetime import date, timedelta
+from urllib.parse import urlparse
+from collections import defaultdict
 
 from searxng import searxng_search
 from fetch import fetch_and_extract
 from dedup import prepare_for_dedup, cluster_near_duplicates
 from rank import score_item
 from llm import chat
-from prompts import (
-    PLANNER_PROMPT,
-    NER_PROMPT,
-    SUMMARIZE_PROMPT,
-    FACTCHECK_PROMPT,
-    COMPOSE_PROMPT,  # tenuto per retrocompatibilità se servisse
-)
+from prompts import PLANNER_PROMPT, NER_PROMPT, SUMMARIZE_PROMPT, FACTCHECK_PROMPT, COMPOSE_PROMPT
 from provenance import log_event
+from timeline import extract_timeline
 
-# --- Nuovi moduli integrati ---
-from sources_reliefweb import fetch_reliefweb_reports
-from evidence import label_support, classify_sources as classify_sources_counts
-from timeline_extractor import extract_events
-from visualization import chart_source_mix, chart_indicator_timeseries, map_events  # map_events al momento opzionale
-from config import (
-    USE_RELIEFWEB,
-    ENGINES_PROFILE_LIGHT,
-    FRESHNESS_HALF_LIFE_DAYS,
-    LLM_TEMPERATURE,
-)
-from quality import is_low_quality, is_index_page
-
-
-# ============================================================
-# Agenti LLM “logici” (planner, ner, summarize/factcheck)
-# ============================================================
-
-def planner(query: str) -> Dict[str, Any]:
-    """Crea un piano di ricerca (subgoals, queries, criteria) via LLM."""
-    msg = [{"role": "system", "content": PLANNER_PROMPT},
-           {"role": "user", "content": query}]
+# ---------------------------
+# Planner (unchanged)
+# ---------------------------
+def planner(query: str):
+    msg = [{"role":"system","content":PLANNER_PROMPT},{"role":"user","content":query}]
     out = chat(msg, max_tokens=900)
     try:
         plan = json.loads(out)
     except Exception:
-        # Fallback minimale se il parsing fallisce
         plan = {
-            "subgoals": ["Mappare attori", "Raccogliere timeline", "Identificare indicatori"],
+            "subgoals": ["Mappare attori","Raccogliere timeline","Identificare indicatori"],
             "queries": [query, f'"{query}" site:reuters.com', f'{query} filetype:pdf'],
-            "criteria": {"freshness_days": 60, "need_institutional": True, "need_diversity": True}
+            "criteria": {"freshness_days": 30, "need_institutional": True, "need_diversity": True}
         }
     log_event("planner_plan", plan)
     return plan
 
-
-def ner_top(docs: List[Dict[str, Any]], topk: int = 12) -> List[Dict[str, Any]]:
-    payload = []
-    for d in docs[:topk]:
-        title = (d.get("title") or "")[:200]
-        text = (d.get("text") or "")[:1200]
-        payload.append({"title": title, "text": text})
-    msg = [{"role": "system", "content": NER_PROMPT},
-           {"role": "user", "content": json.dumps({"docs": payload}, ensure_ascii=False)}]
-    out = chat(msg, max_tokens=1200)
-    try:
-        ents = json.loads(out)
-        if isinstance(ents, list):
-            return ents
-    except Exception:
-        pass
-    return []
-
-
-def summarize_with_citations(ranked: List[Dict[str, Any]], topk: int = 8) -> Tuple[Dict[str, Any], Dict[int, str]]:
-    pack = []
-    refs = {}
-    for i, d in enumerate(ranked[:topk], start=1):
-        refs[i] = d["url"]
-        pack.append({"id": i, "title": d.get("title"), "excerpt": d.get("text", "")[:3000]})
-
-    msg = [
-        {"role": "system", "content": SUMMARIZE_PROMPT},
-        {"role": "user", "content": json.dumps({"sources": pack}, ensure_ascii=False)}
-    ]
-    out = chat(msg, max_tokens=1800)
-    data = {"per_source_summary": {}, "cross_summary": "", "claims": []}
-    try:
-        parsed = json.loads(out)
-        if isinstance(parsed, dict):
-            data.update(parsed)
-    except Exception:
-        pass
-
-    # --- Fallback: se non ci sono claim, generane 3-5 dai titoli top ---
-    if not data.get("claims"):
-        fallback_claims = []
-        for i, d in enumerate(ranked[:min(5, len(ranked))], start=1):
-            title = (d.get("title") or "").strip()
-            if not title:
-                continue
-            fallback_claims.append({
-                "text": title,
-                "sources": [i]  # attribuisci almeno la fonte primaria
-            })
-        data["claims"] = fallback_claims
-
-    # Fallback per cross_summary
-    if not data.get("cross_summary"):
-        titles = [ (d.get("title") or "").strip() for d in ranked[:5] if d.get("title") ]
-        data["cross_summary"] = " • ".join(titles[:4])[:800]
-
-    return data, refs
-
-
-
-def factcheck(claims: List[Dict[str, Any]], sources_map: Dict[int, str]) -> List[Dict[str, Any]]:
-    """Valuta i claim con un fact-check LLM-guidato (schema minimo)."""
-    payload = {"claims": claims, "sources": sources_map}
-    msg = [{"role": "system", "content": FACTCHECK_PROMPT},
-           {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
-    out = chat(msg, max_tokens=1800)
-    try:
-        checks = json.loads(out)
-    except Exception:
-        checks = [{"claim": c.get("text", ""), "support": "unknown", "confidence": 0.4,
-                   "notes": "insufficient evidence"} for c in claims]
-    return checks
-
-
-# ============================================================
-# Ricerca, crawl, dedup/ranking
-# ============================================================
-
-def search(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
-    agg: List[Dict[str, Any]] = []
-
-    for q in plan.get("queries", []):
-        agg += searxng_search(q, engines=ENGINES_PROFILE_LIGHT)
-
-    if USE_RELIEFWEB:
-        try:
-            agg += fetch_reliefweb_reports()
-        except Exception as e:
-            log_event("reliefweb_err", {"err": str(e)})
-
-    # Dedup base per URL + Filtro qualità
-    seen = set()
-    uniq: List[Dict[str, Any]] = []
+# ---------------------------
+# Ricerca / Crawl (unchanged)
+# ---------------------------
+def search(plan):
+    agg = []
+    for q in plan["queries"]:
+        agg += searxng_search(q)
+    # dedup url base
+    seen = set(); uniq = []
     for r in agg:
         u = r.get("url")
-        if not u or u in seen:
-            continue
-        if is_low_quality(u) or is_index_page(u):
-            # scarta pagine indice e domini “opinion”
-            continue
-        uniq.append(r)
-        seen.add(u)
+        if u and u not in seen:
+            uniq.append(r); seen.add(u)
+    log_event("search_uniq", {"count": len(uniq)})
+    return uniq[:80]
 
-    log_event("search_uniq", {"count": len(uniq), "reliefweb": USE_RELIEFWEB})
-    return uniq[:100]
-
-
-def crawl(seeds: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Scarica e pulisce i contenuti HTML testuali."""
-    docs: List[Dict[str, Any]] = []
+def crawl(seeds):
+    docs = []
     for s in seeds[:40]:
         try:
             ext = fetch_and_extract(s["url"])
-            # merge metadata seed + estrazione
+            # merge seed (published normalizzato da searxng) + estratto
             docs.append({**s, **ext})
         except Exception as e:
             log_event("fetch_err", {"url": s.get("url"), "err": str(e)})
             continue
+    log_event("crawl_done", {"docs": len(docs)})
     return docs
 
-
-def dedup_rank(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Near-duplicate detection (SimHash) e ranking time-aware.
-    Tiene il documento più completo/recente per cluster.
-    """
+# ---------------------------
+# Dedup + Ranking (migliorato solo sort)
+# ---------------------------
+def dedup_rank(docs):
     now_ts = time.time()
     prepare_for_dedup(docs)
     clusters = cluster_near_duplicates(docs)
-    picked: List[Dict[str, Any]] = []
-
+    picked = []
     for group in clusters:
-        # tieni il più “ricco” del cluster
-        group_sorted = sorted(
+        group = sorted(
             group,
-            key=lambda d: (len(d.get("text", "")), d.get("detected_date") or ""),
+            key=lambda d: (len(d.get("text","")), _safe_epoch(d)),
             reverse=True
         )
-        picked.append(group_sorted[0])
-
-    # ranking
+        picked.append(group[0])
     for d in picked:
         d["score"] = score_item(d, now_ts)
-
     ranked = sorted(picked, key=lambda d: d["score"], reverse=True)
     log_event("rank_done", {"kept": len(ranked)})
     return ranked
 
+def _safe_epoch(d):
+    from utils_date import to_epoch_seconds
+    return to_epoch_seconds(d.get("detected_date") or d.get("published"))
 
-# ============================================================
-# Composer v2 (con stato della prova, timeline, visual)
-# ============================================================
+# ---------------------------
+# NER con budget & validazione
+# ---------------------------
+def ner_top(docs, topk=12, char_budget=12000):
+    # ... come versione hardening (budget + validazione + log) ...
+    buf, n = [], 0
+    for d in docs[:topk]:
+        title = (d.get("title") or "")
+        text = (d.get("text") or "")[:2000]
+        chunk = f"{title}\n{text}\n\n"
+        if n + len(chunk) > char_budget:
+            break
+        buf.append(chunk); n += len(chunk)
+    msg = [
+        {"role":"system","content": NER_PROMPT},
+        {"role":"user","content": "".join(buf)}
+    ]
+    out = chat(msg, max_tokens=900)
+    try:
+        raw = json.loads(out)
+        ents = [e for e in raw if isinstance(e, dict) and e.get("entity") and e.get("type")]
+        seen=set(); clean=[]
+        for e in ents:
+            ent = e["entity"].strip()
+            typ = e["type"].strip().upper()
+            if not ent: continue
+            k=(ent.lower(), typ)
+            if k in seen: continue
+            seen.add(k); clean.append({"entity": ent, "type": typ, "freq": int(e.get("freq",1))})
+        log_event("ner_ok", {"entities": len(clean)})
+        return clean
+    except Exception:
+        log_event("ner_fail", {})
+        return []
 
-def compose_report_v2(
-    query: str,
-    evidence_rows: List[Dict[str, Any]],
-    ents: List[Dict[str, Any]],
-    refs: Dict[int, str],
-    cross_summary: str,
-    timeline: List[Dict[str, Any]],
-    source_counts: Dict[str, int],
-    source_details: List[Dict[str, Any]],
-    charts: Dict[str, str]
-) -> str:
-    """Genera il Markdown finale (versione arricchita)."""
+def analyze_sentiment_emotions(docs, topk=12, char_budget=12000):
+    # prepara testo concatenato controllando la lunghezza
+    buf, n = [], 0
+    for d in docs[:topk]:
+        title = (d.get("title") or "")
+        text = (d.get("text") or "")[:2000]
+        chunk = f"{title}\n{text}\n\n"
+        if n + len(chunk) > char_budget:
+            break
+        buf.append(chunk); n += len(chunk)
 
-    # Liste entità
-    persons = sorted({e["entity"] for e in ents if e.get("type") == "PERSON"})[:12]
-    orgs = sorted({e["entity"] for e in ents if e.get("type") == "ORG"})[:12]
-    locs = sorted({e["entity"] for e in ents if e.get("type") == "LOC"})[:12]
-    indicators = sorted({e["entity"] for e in ents if e.get("type") == "INDICATOR"})[:12]
+    from prompts import SENTIMENT_EMO_PROMPT
+    msg = [
+        {"role": "system", "content": SENTIMENT_EMO_PROMPT},
+        {"role": "user", "content": "".join(buf)}
+    ]
+    out = chat(msg, max_tokens=600)
+    try:
+        data = json.loads(out)
+        # validazione minimale
+        overall = (data.get("overall_sentiment") or "neutral").lower()
+        if overall not in {"positive","neutral","negative"}:
+            overall = "neutral"
+        conf = float(data.get("confidence", 0.5))
+        em = data.get("emotions") or {}
+        def _clip01(x):
+            try:
+                return max(0.0, min(1.0, float(x)))
+            except Exception:
+                return 0.0
+        emotions = {
+            "anger":   _clip01(em.get("anger", 0.0)),
+            "fear":    _clip01(em.get("fear", 0.0)),
+            "joy":     _clip01(em.get("joy", 0.0)),
+            "sadness": _clip01(em.get("sadness", 0.0)),
+            "surprise":_clip01(em.get("surprise", 0.0)),
+        }
+        out_obj = {
+            "overall_sentiment": overall,
+            "confidence": max(0.0, min(1.0, conf)),
+            "emotions": emotions,
+            "notes": (data.get("notes") or "")[:240]
+        }
+        log_event("sentiment_ok", {"overall": overall, "conf": out_obj["confidence"]})
+        return out_obj
+    except Exception:
+        log_event("sentiment_fail", {})
+        return {
+            "overall_sentiment": "neutral",
+            "confidence": 0.5,
+            "emotions": {"anger":0.0,"fear":0.0,"joy":0.0,"sadness":0.0,"surprise":0.0},
+            "notes":""
+        }
 
-    # Fonti formattate (tabella)
-    ref_lines = "\n".join([f"| {i} | {u} |" for i, u in refs.items()])
-    ref_table = "\n".join([
-        "| # | URL |",
-        "|---|-----|",
-        ref_lines if ref_lines else "| - | - |"
-    ])
+def summarize_with_citations(ranked, topk=8):
+    pack = []
+    refs = {}
+    for i, d in enumerate(ranked[:topk], start=1):
+        refs[i] = d["url"]
+        pack.append({"id": i, "title": d.get("title"), "excerpt": (d.get("text","")[:3000])})
+    msg = [
+        {"role":"system","content":SUMMARIZE_PROMPT},
+        {"role":"user","content":json.dumps({"sources": pack}, ensure_ascii=False)}
+    ]
+    out = chat(msg, max_tokens=1800)
+    try:
+        data = json.loads(out)
+    except Exception:
+        data = {"per_source_summary": {}, "cross_summary": "", "claims": []}
+    log_event("summ_ok", {"claims": len(data.get("claims", []))})
+    return data, refs
 
-    # Tabella evidenze (stato della prova)
-    ev_lines = []
-    for i, row in enumerate(evidence_rows, start=1):
-        srcs = ", ".join([f"[{n}]" for n in row.get("sources", [])])
-        ev_lines.append(f"| {i} | {row.get('claim','').strip()} | {row.get('support_state','unknown')} | {row.get('independence',0)} | {srcs} |")
-    ev_table = "\n".join([
-        "| # | Claim | Stato prova | Indip. fonti | Citazioni |",
-        "|---|---|---|---|---|",
-        *ev_lines
-    ]) if ev_lines else "_Nessun claim estratto._"
+def factcheck(claims, sources_map):
+    # ... identico alla versione hardening ...
+    payload = {"claims": claims, "sources": sources_map}
+    msg = [{"role":"system","content":FACTCHECK_PROMPT},
+           {"role":"user","content":json.dumps(payload, ensure_ascii=False)}]
+    out = chat(msg, max_tokens=1800)
+    try:
+        checks = json.loads(out)
+    except Exception:
+        checks = [{"claim": c.get("text",""), "support":"unknown", "confidence":0.4, "notes":"insufficient evidence"} for c in claims]
+    log_event("factcheck_ok", {"checks": len(checks)})
+    return checks
 
-    # Timeline (bullets)
-    if timeline:
-        timeline_items = [f"- {e['date']} — {e['event']} ([fonte]({e.get('url','#')}))" for e in timeline]
-        timeline_md = "\n".join(timeline_items)
-    else:
-        timeline_md = "- Nessun evento estratto -"
+def _domains_of(ids, refs):
+    doms=set()
+    for i in ids:
+        url = refs.get(i)
+        if not url: continue
+        try:
+            doms.add(urlparse(url).lower().netloc)
+        except Exception:
+            continue
+    return doms
 
-    # Chart: mix tipologie fonti
-    mix_img = charts.get("mix")
-    mix_md = f"![Mix tipologie di fonte]({mix_img})" if mix_img else "-"
+def enrich_and_filter_claims(original_claims, checks, refs, min_support_domains=2, min_conf=0.55):
+    kept_claims, kept_checks = [], []
+    for c, chk in zip(original_claims, checks):
+        src_ids = c.get("sources", [])
+        doms = _domains_of(src_ids, refs)
+        support_ok = chk.get("support") in {"supported","partial"} and float(chk.get("confidence",0)) >= min_conf
+        if len(doms) >= min_support_domains and support_ok:
+            c["cross_agree"] = min(1.0, len(doms)/4.0)
+            kept_claims.append(c)
+            kept_checks.append(chk)
+    log_event("claims_filtered", {"in": len(original_claims), "kept": len(kept_claims)})
+    return kept_claims, kept_checks
 
-    # PRECALCOLA elenco conteggi fonti (evita backslash nelle espressioni f-string)
-    if source_counts:
-        source_count_lines = [f"- {k}: {v}" for k, v in source_counts.items()]
-        source_counts_md = "\n".join(source_count_lines)
-    else:
-        source_counts_md = "-"
+def compose_report(query, checks, ents, refs, per_source_summary, cross_summary, timeline, today_iso, from_iso, senti):
+    persons = sorted({e["entity"] for e in ents if e.get("type")=="PERSON"})[:12]
+    orgs    = sorted({e["entity"] for e in ents if e.get("type")=="ORG"})[:12]
+    locs    = sorted({e["entity"] for e in ents if e.get("type")=="LOC"})[:12]
+    indicators = sorted({e["entity"] for e in ents if e.get("type")=="INDICATOR"})[:12]
+    key_findings = [{"claim": x.get("claim") or x.get("text",""), "confidence": x.get("confidence",0.5)} for x in checks]
 
-    md = f"""# OSINT Report — {query}
-**Data:** {{today}} (Europe/Rome) • **Scope:** Analisi basata su fonti istituzionali/ONG/Media e verifica incrociata.
-
-## Executive Summary
-{cross_summary or "- Sintesi non disponibile -"}
-
----
-
-## Key Findings — Stato della prova
-{ev_table}
-
----
-
-## Timeline (estratta)
-{timeline_md}
-
----
-
-## Attori ed Entità
-- **Persone:** {", ".join(persons) or "-"}
-- **Organizzazioni:** {", ".join(orgs) or "-"}
-- **Luoghi:** {", ".join(locs) or "-"}
-- **Indicatori menzionati:** {", ".join(indicators) or "-"}
-
----
-
-## Tipologie di fonte (conteggio)
-{mix_md}
-
-{source_counts_md}
-
----
-
-## Fonti
-{ref_table}
-
----
-
-## Metodologia & Provenance
-- Ricerca: SearXNG (profilo 'light'), pagine=1, categorie=news/web; + ReliefWeb API.
-- Dedup: canonical URL + SimHash (Hamming ≤ {{hamming}}).
-- Ranking: freschezza (t½={{half_life}} gg), autorità dominio, completezza, coerenza.
-- LLM: NER/sintesi/fact-check; temperature={{temp}}.
-- Snapshot/hash: ove possibile.
-- Etica: niente PII non necessarie; rispetto robots/ToS.
-
-"""
-    # Sostituzioni runtime basilari
-    from datetime import datetime
-    md = md.replace("{today}", datetime.now().strftime("%Y-%m-%d"))
-    from config import FRESHNESS_HALF_LIFE_DAYS, LLM_TEMPERATURE
-    md = md.replace("{half_life}", str(FRESHNESS_HALF_LIFE_DAYS))
-    md = md.replace("{hamming}", "6")
-    md = md.replace("{temp}", str(LLM_TEMPERATURE))
+    payload = {
+        "query": query,
+        "key_findings": key_findings,
+        "entities": {"persons": persons, "orgs": orgs, "locs": locs, "indicators": indicators},
+        "refs": refs,
+        "per_source_summary": per_source_summary or {},
+        "timeline": timeline or [],
+        "cross_summary": cross_summary or "",
+        "today_iso": today_iso,
+        "from_iso": from_iso,
+        # >>> NUOVO BLOCCO
+        "sentiment": {
+            "overall": senti.get("overall_sentiment","neutral"),
+            "confidence": senti.get("confidence",0.5),
+            "emotions": senti.get("emotions", {}),
+            "notes": senti.get("notes","")
+        }
+    }
+    msg = [{"role":"system","content":COMPOSE_PROMPT},
+           {"role":"user","content":json.dumps(payload, ensure_ascii=False)}]
+    md = chat(msg, max_tokens=2400)
     return md
 
-
-
-# ============================================================
-# Colla di pipeline
-# ============================================================
-
-def run_pipeline(query: str, topk: int = 8) -> Tuple[str, Dict[str, Any]]:
-    """
-    Esegue l'intera pipeline e restituisce:
-      - md: Markdown finale
-      - extra: diagnostica/artefatti utili
-    """
-    # Planning
+def run_pipeline(query: str, topk: int = 8):
     plan = planner(query)
-
-    # Search
     seeds = search(plan)
-
-    # Crawl & extract
     docs = crawl(seeds)
 
-    # Dedup & ranking
+    freshness_days = int(plan.get("criteria", {}).get("freshness_days", 30) or 30)
+    today_iso = date.today().isoformat()
+    from_iso = (date.today() - timedelta(days=freshness_days)).isoformat()
+
+    def _date_of(d):
+        return (d.get("detected_date") or d.get("published") or "")[:10]
+
+    before_filter = len(docs)
+    docs = [d for d in docs if not _date_of(d) or _date_of(d) >= from_iso]
+    log_event("freshness_filter", {"from": from_iso, "before": before_filter, "after": len(docs)})
+
     ranked = dedup_rank(docs)
-
-    # NER
     ents = ner_top(ranked, topk=topk)
-
-    # Sintesi con citazioni [n]
     summ, refs = summarize_with_citations(ranked, topk=topk)
 
-    # Fact-check dei claim
-    checks = factcheck(summ.get("claims", []), refs)
+    original_claims = summ.get("claims", [])
+    checks = factcheck(original_claims, refs)
+    kept_claims, kept_checks = enrich_and_filter_claims(original_claims, checks, refs)
 
-    # === Stato della prova per i claim (con indipendenza fonti) ===
-    enriched_checks = []
-    for c in summ.get("claims", []):
-        sources = c.get("sources", [])
-        state, indep = label_support(sources, refs)
-        enriched_checks.append({
-            "claim": c.get("text", ""),
-            "support_state": state,
-            "independence": indep,
-            "sources": sources
-        })
+    # Timeline robusta (già presente se hai integrato la timeline.py)
+    timeline = extract_timeline(ranked, refs, from_iso, today_iso, max_events=12)
 
-    # === Classificazione tipologie fonte ===
-    counts, source_details = classify_sources_counts(refs)
+    # >>> NUOVO: sentiment & emozioni
+    senti = analyze_sentiment_emotions(ranked, topk=topk)
 
-    # === Timeline estratta (heuristica) ===
-    timeline = extract_events(ranked, max_events=12)
-
-    # === Grafico: mix tipologie di fonte ===
-    mix_png = chart_source_mix(counts)
-
-    # (Opzionale) KPI numerici se disponibili:
-    # es. serie = [("2025-10-15", 6.9), ("2025-10-30", 7.1)]
-    # kpi_png = chart_indicator_timeseries(serie, title="IDP (milioni)")
-
-    # Compose MD (v2)
-    md = compose_report_v2(
-        query=query,
-        evidence_rows=enriched_checks,
-        ents=ents,
-        refs=refs,
-        cross_summary=summ.get("cross_summary", ""),
-        timeline=timeline,
-        source_counts=counts,
-        source_details=source_details,
-        charts={"mix": mix_png},
+    md = compose_report(
+        query,
+        kept_checks,
+        ents,
+        refs,
+        summ.get("per_source_summary", {}),
+        summ.get("cross_summary", ""),
+        timeline,
+        today_iso,
+        from_iso,
+        senti  # <-- nuovo argomento
     )
 
-    extra = {
-        "ranked": ranked,
+    # extra snellito e serializzabile
+    extra_ranked = []
+    for d in ranked[:50]:
+        extra_ranked.append({
+            "url": d.get("url"),
+            "title": d.get("title"),
+            "domain": d.get("domain"),
+            "detected_date": d.get("detected_date"),
+            "published": d.get("published"),
+            "score": d.get("score"),
+            "len_text": len(d.get("text","")),
+            "is_live": bool(d.get("is_live")),
+        })
+
+    return md, {
+        "ranked": extra_ranked,
         "entities": ents,
         "refs": refs,
-        "checks_raw": checks,
+        "checks": kept_checks,
         "plan": plan,
-        "evidence": enriched_checks,
-        "timeline": timeline,
-        "source_counts": counts,
-        "source_details": source_details,
-        "charts": {"mix": mix_png},
+        "freshness_from": from_iso,
+        "timeline": timeline
     }
-    return md, extra
